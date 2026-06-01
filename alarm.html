@@ -1,0 +1,210 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>AI Driver Drowsiness Alert</title>
+    <!-- Load MediaPipe Tasks Vision library -->
+    <script src="https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/vision_bundle.js" crossorigin="anonymous"></script>
+    <style>
+        body {
+            font-family: 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+            background: radial-gradient(circle at center, #1a1a2e 0%, #0a0a12 100%);
+            color: white;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+            margin: 0;
+            padding: 20px;
+            min-height: 100vh;
+            justify-content: center;
+            overflow: hidden;
+        }
+        h1 {
+            font-size: 2rem;
+            margin-bottom: 2rem;
+            letter-spacing: 5px;
+            text-transform: uppercase;
+            background: linear-gradient(90deg, #00d2ff, #3a7bd5);
+            -webkit-background-clip: text;
+            background-clip: text;
+            -webkit-text-fill-color: transparent;
+            font-weight: 900;
+        }
+        .container {
+            position: relative;
+            width: 100%;
+            max-width: 640px;
+            aspect-ratio: 4 / 3;
+            border-radius: 30px;
+            overflow: hidden;
+            box-shadow: 0 0 50px rgba(0, 210, 255, 0.2);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            background: #000;
+        }
+        video, canvas {
+            position: absolute;
+            left: 0; top: 0; width: 100%; height: 100%;
+            object-fit: cover;
+            transform: scaleX(-1);
+        }
+        #status-box {
+            margin-top: 30px;
+            padding: 15px 45px;
+            border-radius: 100px;
+            font-size: 1.2rem;
+            font-weight: 800;
+            background: rgba(255, 255, 255, 0.05);
+            backdrop-filter: blur(10px);
+            border: 1px solid rgba(255, 255, 255, 0.1);
+            text-align: center;
+            transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1);
+            min-width: 280px;
+            color: #fff;
+            letter-spacing: 2px;
+        }
+        .alarm {
+            background: rgba(231, 76, 60, 0.3) !important;
+            border-color: #e74c3c !important;
+            box-shadow: 0 0 30px rgba(231, 76, 60, 0.4);
+            animation: pulse 0.6s infinite ease-in-out;
+        }
+        @keyframes pulse {
+            0% { transform: scale(1); }
+            50% { transform: scale(1.05); }
+            100% { transform: scale(1); }
+        }
+        .metrics {
+            margin-top: 20px;
+            color: rgba(255, 255, 255, 0.3);
+            font-family: 'Courier New', Courier, monospace;
+            font-size: 0.9rem;
+        }
+    </style>
+</head>
+<body>
+    <h1>SafeDrive AI</h1>
+    <div class="container">
+        <video id="webcam" autoplay playsinline></video>
+        <canvas id="output_canvas"></canvas>
+    </div>
+    <div id="status-box">CLICK ANYWHERE TO START</div>
+    <div class="metrics" id="ear-val">EAR: 0.00</div>
+
+    <script type="module">
+        import { FaceLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3";
+
+        const video = document.getElementById("webcam");
+        const canvas = document.getElementById("output_canvas");
+        const canvasCtx = canvas.getContext("2d");
+        const statusBox = document.getElementById("status-box");
+        const earDisplay = document.getElementById("ear-val");
+
+        let faceLandmarker;
+        let lastVideoTime = -1;
+        let sleepStartTime = null;
+        let audioCtx = null;
+        let isAlarmPlaying = false;
+        let initialized = false;
+
+        // Auto-initialize on user interaction
+        document.body.addEventListener("click", () => {
+            if (initialized) return;
+            initialized = true;
+            audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+            statusBox.innerText = "INITIALIZING AI...";
+            setup();
+        }, { once: true });
+
+        function playAlarmSound() {
+            if (!audioCtx || isAlarmPlaying) return;
+            isAlarmPlaying = true;
+            const osc = audioCtx.createOscillator();
+            const gain = audioCtx.createGain();
+            osc.type = "sawtooth";
+            osc.frequency.setValueAtTime(800, audioCtx.currentTime);
+            gain.gain.setValueAtTime(0.2, audioCtx.currentTime);
+            osc.connect(gain).connect(audioCtx.destination);
+            osc.start();
+            osc.stop(audioCtx.currentTime + 0.5);
+            setTimeout(() => { isAlarmPlaying = false; }, 600);
+        }
+
+        // Constants from your Python script
+        const EAR_THRESHOLD = 0.22;
+        const SLEEP_DURATION_MS = 1500; // 1.5 seconds
+        const LEFT_EYE_INDICES = [362, 385, 387, 263, 373, 380];
+        const RIGHT_EYE_INDICES = [33, 160, 158, 133, 153, 144];
+
+        async function setup() {
+            const filesetResolver = await FilesetResolver.forVisionTasks(
+                "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm"
+            );
+            faceLandmarker = await FaceLandmarker.createFromOptions(filesetResolver, {
+                baseOptions: {
+                    modelAssetPath: `https://storage.googleapis.com/mediapipe-models/face_landmarker/face_landmarker/float16/1/face_landmarker.task`,
+                    delegate: "GPU"
+                },
+                outputFaceBlendshapes: true,
+                runningMode: "VIDEO",
+                numFaces: 1
+            });
+            
+            startCamera();
+        }
+
+        function startCamera() {
+            navigator.mediaDevices.getUserMedia({ video: { width: 640, height: 480 } }).then((stream) => {
+                video.srcObject = stream;
+                video.addEventListener("loadeddata", predictWebcam);
+                statusBox.innerText = "MONITORING ACTIVE";
+            });
+        }
+
+        function calculateEAR(landmarks, indices) {
+            const coords = indices.map(i => landmarks[i]);
+            
+            // Math.hypot calculates Euclidean distance
+            const v1 = Math.hypot(coords[1].x - coords[5].x, coords[1].y - coords[5].y);
+            const v2 = Math.hypot(coords[2].x - coords[4].x, coords[2].y - coords[4].y);
+            const h = Math.hypot(coords[0].x - coords[3].x, coords[0].y - coords[3].y);
+            
+            return (v1 + v2) / (2.0 * h);
+        }
+
+        async function predictWebcam() {
+            if (lastVideoTime !== video.currentTime) {
+                lastVideoTime = video.currentTime;
+                const results = faceLandmarker.detectForVideo(video, performance.now());
+
+                canvasCtx.clearRect(0, 0, canvas.width, canvas.height);
+
+                if (results.faceLandmarks && results.faceLandmarks.length > 0) {
+                    const landmarks = results.faceLandmarks[0];
+                    const lEar = calculateEAR(landmarks, LEFT_EYE_INDICES);
+                    const rEar = calculateEAR(landmarks, RIGHT_EYE_INDICES);
+                    const avgEar = (lEar + rEar) / 2.0;
+
+                    earDisplay.innerText = `EAR: ${avgEar.toFixed(2)}`;
+
+                    if (avgEar < EAR_THRESHOLD) {
+                        if (!sleepStartTime) sleepStartTime = Date.now();
+                        
+                        const duration = Date.now() - sleepStartTime;
+                        if (duration > SLEEP_DURATION_MS) {
+                            statusBox.innerText = "!!! WAKE UP !!!";
+                            statusBox.classList.add("alarm");
+                            playAlarmSound();
+                        }
+                    } else {
+                        sleepStartTime = null;
+                        statusBox.innerText = "MONITORING ACTIVE";
+                        statusBox.classList.remove("alarm");
+                    }
+                }
+            }
+            window.requestAnimationFrame(predictWebcam);
+        }
+    </script>
+</body>
+</html>
